@@ -1,17 +1,17 @@
 #!/usr/bin/python3
-# import dbus
+import re
+import dbus
 import colorlog
 import logging
 import os
 from subprocess import check_output, run
 import socket
 import time
-import datetime
 from threading import Timer
-
 
 from advertisement import Advertisement
 from service import Application, Service, Characteristic
+from api import blyqt_start_recording, blyqt_stop_recording
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +31,10 @@ DEVICE_STATUS_CHARACTERISTIC_UUID = "00002007-710e-4a5b-8d75-3e5b444bc3cf"
 class VpsAdvertisement(Advertisement):
     def __init__(self, index):
         Advertisement.__init__(self, index, "peripheral")
-        local_name = "VPS_" + socket.gethostname()
+        local_name = "VPS-" + socket.gethostname()
         self.add_local_name(local_name)
         self.include_tx_power = True
-        # logger.debug("Debug: Starting BLE advertisement")
+        logger.info(f"Starting BLE advertisement")
 
 
 class VpsService(Service):
@@ -47,7 +47,7 @@ class VpsService(Service):
         self.add_characteristic(TerminalCharacteristic(self))
         self.add_characteristic(RemoteControlCharacteristic(self))
         self.add_characteristic(DeviceStatusCharacteristic(self))
-        # logger.debug("Debug: Adding characteristics to service")
+        logger.info(f"Adding characteristics to service")
 
 
 class RemoteControlCharacteristic(Characteristic):
@@ -55,19 +55,38 @@ class RemoteControlCharacteristic(Characteristic):
         Characteristic.__init__(self, REMOTE_CONTROL_CHARACTERISTIC_UUID, ["write"], service)
 
     def WriteValue(self, value, options):
-        received_value = "".join([chr(byte) for byte in value])
+        # received_value = "".join([chr(byte) for byte in value])  
+        received_value = bytearray(value).decode()
         logger.debug("Debug: Value received: " + received_value)
+        if received_value == "0":
+            blyqt_start_recording()
+        elif received_value == "1":
+            blyqt_start_recording()
+
         # TODO:
-        # Start recording trigger
+        # Calibration, reset to factory settings, ..
 
 
 class DeviceStatusCharacteristic(Characteristic):
     def __init__(self, service):
-        Characteristic.__init__(self, DEVICE_STATUS_CHARACTERISTIC_UUID, ["read"], service)
+        Characteristic.__init__(self, DEVICE_STATUS_CHARACTERISTIC_UUID, ["read", "notify"], service)
+        self.notifying = False
+        self.batLvl = 1
 
     def ReadValue(self, options):
-        status = "69,Ready"
+        self.batLvl = get_batt_level()
+        status = "%s,Ready" % (self.batLvl)
         return status.encode("utf-8")
+    
+    def StartNotify(self):
+        if self.notifying:
+            return
+        self.notifying = True
+
+    def StopNotify(self):
+        if not self.notifying:
+            return
+        self.notifying = False
 
 
 class TerminalCharacteristic(Characteristic):
@@ -81,6 +100,7 @@ class TerminalCharacteristic(Characteristic):
 
     def ReadValue(self, options):
         self.output += "1"
+        print("read terminal {self.output}")
         return self.output.encode("utf-8")
 
     def WriteValue(self, value, options):
@@ -95,22 +115,45 @@ class TerminalCharacteristic(Characteristic):
         if self.notifying:
             return
         self.notifying = True
-        self.update_timer = Timer(1.0, self.periodic_update)
-        self.update_timer.start()
+        # self.update_timer = Timer(1.0, self.periodic_update)
+        # self.update_timer.start()
+        self.PropertiesChanged(GATT_CHRC_IFACE, {"Value": "1"}, [])
+        self.add_timeout(1000, self.set_temperature_callback)
 
     def StopNotify(self):
         if not self.notifying:
             return
         self.notifying = False
-        if self.update_timer:
-            self.update_timer.cancel()
+        # if self.update_timer:
+        #     self.update_timer.cancel()
 
-    def periodic_update(self):
+    # def periodic_update(self):
+    #     if self.notifying:
+    #         print("timer")
+    #         self.output += "1"
+    #         self.PropertiesChanged(GATT_CHRC_IFACE, {"Value": self.output.encode("utf-8")}, [])
+    #         self.update_timer = Timer(1.0, self.periodic_update)
+    #         self.update_timer.start()
+
+    def set_temperature_callback(self):
         if self.notifying:
-            self.output += "1"
-            self.PropertiesChanged(GATT_CHRC_IFACE, {"Value": self.output.encode("utf-8")}, [])
-            self.update_timer = Timer(1.0, self.periodic_update)
-            self.update_timer.start()
+            print("trigger")
+            value = 1
+            self.PropertiesChanged(GATT_CHRC_IFACE, {"Value": value}, [])
+        return self.notifying
+
+    # def StartNotify(self):
+    #     if self.notifying:
+    #         return
+
+    #     self.notifying = True
+
+    #     value = self.get_temperature()
+    #     self.PropertiesChanged(GATT_CHRC_IFACE, {"Value": value}, [])
+    #     self.add_timeout(NOTIFY_TIMEOUT, self.set_temperature_callback)
+
+    # def StopNotify(self):
+    #     self.notifying = False
 
 
 class WifiConnectCharacteristic(Characteristic):
@@ -137,7 +180,6 @@ class CurrentSSIDCharacteristic(Characteristic):
         return cssid.encode("utf-8")
     
 
-
 class IPCharacteristic(Characteristic):
     def __init__(self, service):
         Characteristic.__init__(self, IP_CHARACTERISTIC_UUID, ["read"], service)
@@ -155,17 +197,6 @@ class LocalNameCharacteristic(Characteristic):
     def ReadValue(self, options):
         host_name = socket.gethostname()
         return host_name.encode("utf-8")
-
-
-# class CommandCharacteristic(Characteristic):
-#     def __init__(self, service):
-#         Characteristic.__init__(self, REMOTE_CONTROL_CHARACTERISTIC_UUID, ["write"], service)
-
-#     def WriteValue(self, value, options):
-#         received_value = "".join([chr(byte) for byte in value])
-#         logger.debug("Debug: Value received: " + received_value)
-#         # TODO:
-#         # Start recording trigger
 
 
 def run_command(command, timeout_sec=0.3):
@@ -201,15 +232,6 @@ def setup_logging(level):
     logger.setLevel(level)
 
 
-# def get_connected_ssid():
-#     try:
-#         output = check_output(["iwgetid", "-r"])
-#         connected_ssid = output.strip().decode("utf-8")
-#         return connected_ssid
-#     except CalledProcessError:
-#         return "Not Connected"
-
-
 def get_connected_ssid():
     output = check_output(["nmcli", "connection", "show", "--active"], universal_newlines=True)
     lines = output.split('\n')
@@ -218,16 +240,12 @@ def get_connected_ssid():
             return line.split()[0]
     return "Not connected"
 
-# def connect_to_wifi(ssid, password):
-#     WPA_SUPPLICANT_CONF_PATH = "/etc/wpa_supplicant/wpa_supplicant.conf"
-#     # append new credentials
-#     # cmd = f"wpa_passphrase {ssid} {password} | sudo tee -a {WPA_SUPPLICANT_CONF_PATH} > /dev/null"
-#     # print(cmd)
-#     # os.system(cmd)
 
-#     run_command(f"nmcli d wifi connect {ssid} password {password}")
-#     # reconfigure wifi
-#     # os.system("wpa_cli -i wlan0 reconfigure")
+def get_batt_level():
+    check_batt_status_command = "dbus-send --system --print-reply --dest=io.vpsrecorder.mcucom /io/vpsrecorder/mcucom io.vpsrecorder.mcucom.getBatterySOC boolean:true"
+    output = check_output(check_batt_status_command, shell=True, universal_newlines=True)
+    match = re.search(r'uint16 (\d+)', output)
+    return int(match.group(1))
 
 
 if __name__ == "__main__":
@@ -235,11 +253,11 @@ if __name__ == "__main__":
     setup_logging(LOG_LEVEL)
 
     logger.info("Turning on bluetooth")
-    # ok = start_bluetooth()
-    # if not ok:
-    #     logger.error(f"Failed to activate bluetooth")
-    # else:
-    #     logger.info(f"Bluetooth activated")
+    ok = start_bluetooth()
+    if not ok:
+        logger.error(f"Failed to activate bluetooth")
+    else:
+        logger.info(f"Bluetooth activated")
 
     app = Application()
     logger.info(f"Application created")
